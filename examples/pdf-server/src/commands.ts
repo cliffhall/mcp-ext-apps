@@ -66,4 +66,5 @@ export type PdfCommand =
       getScreenshots: boolean;
     }
   | { type: "save_as"; requestId: string }
+  | { type: "get_viewer_state"; requestId: string }
   | { type: "file_changed"; mtimeMs: number };

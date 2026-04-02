@@ -305,6 +305,33 @@ function waitForSaveData(
   });
 }
 
+const pendingStateRequests = new Map<string, (v: string | Error) => void>();
+
+/**
+ * Wait for the viewer to report its current state (page, zoom, selection, …)
+ * as a JSON string. Same timeout/abort semantics as waitForSaveData.
+ */
+function waitForViewerState(
+  requestId: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const settle = (v: string | Error) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      pendingStateRequests.delete(requestId);
+      v instanceof Error ? reject(v) : resolve(v);
+    };
+    const onAbort = () => settle(new Error("interact request cancelled"));
+    const timer = setTimeout(
+      () => settle(new Error("Timeout waiting for viewer state")),
+      GET_PAGES_TIMEOUT_MS,
+    );
+    signal?.addEventListener("abort", onAbort);
+    pendingStateRequests.set(requestId, settle);
+  });
+}
+
 interface QueueEntry {
   commands: PdfCommand[];
   /** Timestamp of the most recent enqueue or dequeue */
@@ -1350,7 +1377,8 @@ Returns a viewUUID in structuredContent. Pass it to \`interact\`:
 - add_annotations, update_annotations, remove_annotations, highlight_text
 - fill_form (fill PDF form fields)
 - navigate, search, find, search_navigate, zoom
-- get_text, get_screenshot (extract content)
+- get_text, get_screenshot, get_viewer_state (extract content / read selection & current page)
+- save_as (write annotated PDF to disk)
 
 Accepts local files (use list_pdfs), client MCP root directories, or any HTTPS URL.
 Set \`elicit_form_inputs\` to true to prompt the user to fill form fields before display.`,
@@ -1650,6 +1678,7 @@ URL: ${normalized}`,
           "fill_form",
           "get_text",
           "get_screenshot",
+          "get_viewer_state",
           "save_as",
         ])
         .describe("Action to perform"),
@@ -2238,6 +2267,26 @@ URL: ${normalized}`,
             );
           }
         }
+        case "get_viewer_state": {
+          const requestId = randomUUID();
+          enqueueCommand(uuid, { type: "get_viewer_state", requestId });
+          let state: string;
+          try {
+            await ensureViewerIsPolling(uuid);
+            state = await waitForViewerState(requestId, signal);
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          return { content: [{ type: "text", text: state }] };
+        }
         default:
           return {
             content: [{ type: "text", text: `Unknown action: ${action}` }],
@@ -2295,6 +2344,7 @@ Example — add a signature image and a stamp, then screenshot to verify:
 **TEXT/SCREENSHOTS**:
 • get_text: extract text from pages. Optional \`page\` for single page, or \`intervals\` for ranges [{start?,end?}]. Max 20 pages.
 • get_screenshot: capture a single page as PNG image. Requires \`page\`.
+• get_viewer_state: snapshot of the live viewer — JSON {currentPage, pageCount, zoom, displayMode, selectedAnnotationIds, selection:{text,contextBefore,contextAfter,boundingRect}|null}. Use this to read what the user has selected or which page they're on.
 
 **FORMS** — fill_form: fill fields with \`fields\` array of {name, value}.
 
@@ -2320,6 +2370,7 @@ Example — add a signature image and a stamp, then screenshot to verify:
               "fill_form",
               "get_text",
               "get_screenshot",
+              "get_viewer_state",
               "save_as",
             ])
             .optional()
@@ -2598,6 +2649,48 @@ Example — add a signature image and a stamp, then screenshot to verify:
           settle(new Error(error || "Viewer returned no data"));
         } else {
           settle(data);
+        }
+        return { content: [{ type: "text", text: "Submitted" }] };
+      },
+    );
+
+    // Tool: submit_viewer_state (app-only) - Viewer reports its live state
+    registerAppTool(
+      server,
+      "submit_viewer_state",
+      {
+        title: "Submit Viewer State",
+        description:
+          "Submit a viewer-state snapshot for a get_viewer_state request (used by viewer). The model should NOT call this tool directly.",
+        inputSchema: {
+          requestId: z
+            .string()
+            .describe("The request ID from the get_viewer_state command"),
+          state: z
+            .string()
+            .optional()
+            .describe("JSON-encoded viewer state snapshot"),
+          error: z
+            .string()
+            .optional()
+            .describe("Error message if the viewer failed to read state"),
+        },
+        _meta: { ui: { visibility: ["app"] } },
+      },
+      async ({ requestId, state, error }): Promise<CallToolResult> => {
+        const settle = pendingStateRequests.get(requestId);
+        if (!settle) {
+          return {
+            content: [
+              { type: "text", text: `No pending request for ${requestId}` },
+            ],
+            isError: true,
+          };
+        }
+        if (error || !state) {
+          settle(new Error(error || "Viewer returned no state"));
+        } else {
+          settle(state);
         }
         return { content: [{ type: "text", text: "Submitted" }] };
       },

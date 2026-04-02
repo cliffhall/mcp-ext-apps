@@ -2428,6 +2428,84 @@ async function renderPageOffscreen(pageNum: number): Promise<string> {
   return dataUrl.split(",")[1];
 }
 
+/**
+ * Snapshot the live viewer for `interact({action:"get_viewer_state"})`.
+ *
+ * Selection is read from `window.getSelection()` at call time — no caching;
+ * if the user navigated away or nothing is selected, `selection` is `null`.
+ * `boundingRect` is in model coords (PDF points, origin top-left, y-down) so
+ * it can be fed straight back into `add_annotations`.
+ */
+async function handleGetViewerState(requestId: string): Promise<void> {
+  const CONTEXT_CHARS = 200;
+
+  let selection: {
+    text: string;
+    contextBefore: string;
+    contextAfter: string;
+    boundingRect: { x: number; y: number; width: number; height: number };
+  } | null = null;
+
+  const sel = window.getSelection();
+  const selectedText = sel?.toString().replace(/\s+/g, " ").trim();
+  if (sel && selectedText && sel.rangeCount > 0) {
+    // Only treat it as a PDF selection if it lives inside the text layer of
+    // the rendered page (not the toolbar, search box, etc.).
+    const range = sel.getRangeAt(0);
+    const anchor =
+      range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+        ? (range.commonAncestorContainer as Element)
+        : range.commonAncestorContainer.parentElement;
+    if (anchor && textLayerEl.contains(anchor)) {
+      // Context: locate selection in the page's extracted text and slice
+      // ±CONTEXT_CHARS around it. Falls back to empty strings if fuzzy
+      // match fails (still return text + rect — they're the load-bearing
+      // bits).
+      const pageText = pageTextCache.get(currentPage) ?? "";
+      const loc = findSelectionInText(pageText, selectedText);
+      const contextBefore = loc
+        ? pageText.slice(Math.max(0, loc.start - CONTEXT_CHARS), loc.start)
+        : "";
+      const contextAfter = loc
+        ? pageText.slice(loc.end, loc.end + CONTEXT_CHARS)
+        : "";
+
+      // Single bounding box, page-relative model coords. getBoundingClientRect
+      // is viewport-relative; subtract the page-wrapper origin then divide by
+      // scale → PDF points (top-left origin, y-down — matches the coord
+      // system documented in the interact tool description).
+      const r = range.getBoundingClientRect();
+      const origin = pageWrapperEl.getBoundingClientRect();
+      const round = (n: number) => Math.round(n * 100) / 100;
+      selection = {
+        text: selectedText,
+        contextBefore,
+        contextAfter,
+        boundingRect: {
+          x: round((r.left - origin.left) / scale),
+          y: round((r.top - origin.top) / scale),
+          width: round(r.width / scale),
+          height: round(r.height / scale),
+        },
+      };
+    }
+  }
+
+  const state = {
+    currentPage,
+    pageCount: totalPages,
+    zoom: Math.round(scale * 100),
+    displayMode: currentDisplayMode,
+    selectedAnnotationIds: [...selectedAnnotationIds],
+    selection,
+  };
+
+  await app.callServerTool({
+    name: "submit_viewer_state",
+    arguments: { requestId, state: JSON.stringify(state, null, 2) },
+  });
+}
+
 async function handleGetPages(cmd: {
   requestId: string;
   intervals: Array<{ start?: number; end?: number }>;
@@ -4670,6 +4748,23 @@ async function processCommands(commands: PdfCommand[]): Promise<void> {
           await app
             .callServerTool({
               name: "submit_save_data",
+              arguments: {
+                requestId: cmd.requestId,
+                error: err instanceof Error ? err.message : String(err),
+              },
+            })
+            .catch(() => {});
+        }
+        break;
+      case "get_viewer_state":
+        // Same await-before-next-poll discipline as get_pages/save_as.
+        try {
+          await handleGetViewerState(cmd.requestId);
+        } catch (err) {
+          log.error("get_viewer_state failed — submitting error:", err);
+          await app
+            .callServerTool({
+              name: "submit_viewer_state",
               arguments: {
                 requestId: cmd.requestId,
                 error: err instanceof Error ? err.message : String(err),
