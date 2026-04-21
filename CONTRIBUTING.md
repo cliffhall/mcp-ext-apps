@@ -27,6 +27,14 @@ We welcome contributions to the MCP Apps SDK! This document outlines the process
 - Provide a clear description of changes
 - **Keep "Allow edits by maintainers" checked** when opening your PR — this lets maintainers rebase your branch and lets the [`/update-snapshots` workflow](#updating-snapshots-in-ci) push updated screenshots to it
 
+## Examples Policy
+
+The examples in `examples/` are maintained by the core team. **We do not accept pull requests that add new example servers from outside contributors.** Each example carries an ongoing maintenance cost — keeping it building, tested, and up to date with SDK changes — so we are deliberate about what we add.
+
+If you have an idea for an example that would provide significant educational value, please [open an issue](https://github.com/modelcontextprotocol/ext-apps/issues) describing what the example would demonstrate and why it would be useful, and maintainers will evaluate the request.
+
+PRs that add new examples without a prior approved issue may be closed.
+
 ## Running Examples
 
 Start the development environment with hot reloading:
