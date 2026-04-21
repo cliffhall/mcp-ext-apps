@@ -304,9 +304,21 @@ function App_onlisttools_returnTools(app: App) {
   app.onlisttools = async (params, extra) => {
     return {
       tools: [
-        { name: "greet", inputSchema: { type: "object" as const } },
-        { name: "calculate", inputSchema: { type: "object" as const } },
-        { name: "format", inputSchema: { type: "object" as const } },
+        {
+          name: "greet",
+          description: "Greet the user",
+          inputSchema: { type: "object" as const },
+        },
+        {
+          name: "calculate",
+          description: "Perform a calculation",
+          inputSchema: { type: "object" as const },
+        },
+        {
+          name: "format",
+          description: "Format text",
+          inputSchema: { type: "object" as const },
+        },
       ],
     };
   };

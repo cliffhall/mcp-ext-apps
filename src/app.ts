@@ -1,5 +1,6 @@
 import {
   type RequestOptions,
+  mergeCapabilities,
   ProtocolOptions,
 } from "@modelcontextprotocol/sdk/shared/protocol.js";
 
@@ -26,6 +27,9 @@ import {
   ReadResourceRequest,
   ReadResourceResult,
   ReadResourceResultSchema,
+  Tool,
+  ToolAnnotations,
+  ToolListChangedNotification,
 } from "@modelcontextprotocol/sdk/types.js";
 import { AppNotification, AppRequest, AppResult } from "./types";
 import { ProtocolWithEvents } from "./events";
@@ -65,6 +69,16 @@ import {
   McpUiRequestDisplayModeResultSchema,
 } from "./types";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import {
+  StandardSchemaV1,
+  standardSchemaToJsonSchema,
+  validateStandardSchema,
+} from "./standard-schema";
+
+export type {
+  StandardSchemaV1,
+  StandardSchemaWithJSON,
+} from "./standard-schema";
 
 export { PostMessageTransport } from "./message-transport";
 export * from "./types";
@@ -180,6 +194,66 @@ type RequestHandlerExtra = Parameters<
 >[1];
 
 /**
+ * Result of an app-registered tool callback. When `Out` is provided,
+ * `structuredContent` is required and typed (unless `isError: true`).
+ */
+export type AppToolResult<
+  Out extends StandardSchemaV1 | undefined = undefined,
+> = Out extends StandardSchemaV1
+  ?
+      | (CallToolResult & {
+          structuredContent: StandardSchemaV1.InferOutput<Out>;
+          isError?: false;
+        })
+      | (CallToolResult & { isError: true })
+  : CallToolResult;
+
+/**
+ * Callback for an app-registered tool. When `In` is provided, `args` is the
+ * validated/parsed input; when `In` is `undefined`, the callback receives only
+ * `extra`. When `Out` is provided, the return's `structuredContent` is typed.
+ *
+ * Mirrors `ToolCallback` from `@modelcontextprotocol/sdk/server/mcp.js` but is
+ * parameterized over {@link StandardSchemaV1} instead of zod, so any
+ * Standard-Schema-compatible library (Zod, ArkType, Valibot, …) can be used.
+ */
+export type AppToolCallback<
+  In extends StandardSchemaV1 | undefined = undefined,
+  Out extends StandardSchemaV1 | undefined = undefined,
+> = In extends StandardSchemaV1
+  ? (
+      args: StandardSchemaV1.InferOutput<In>,
+      extra: RequestHandlerExtra,
+    ) => AppToolResult<Out> | Promise<AppToolResult<Out>>
+  : (
+      extra: RequestHandlerExtra,
+    ) => AppToolResult<Out> | Promise<AppToolResult<Out>>;
+
+/**
+ * Handle returned by {@link App.registerTool}. Mirrors `RegisteredTool` from
+ * `@modelcontextprotocol/sdk/server/mcp.js` but stores
+ * {@link StandardSchemaV1} schemas.
+ */
+export type RegisteredAppTool = {
+  title?: string;
+  description?: string;
+  inputSchema?: StandardSchemaV1;
+  outputSchema?: StandardSchemaV1;
+  annotations?: ToolAnnotations;
+  _meta?: Record<string, unknown>;
+  enabled: boolean;
+  enable(): void;
+  disable(): void;
+  remove(): void;
+  update(updates: Partial<Omit<RegisteredAppTool, "update">>): void;
+  /** @internal */
+  handler: (
+    args: unknown,
+    extra: RequestHandlerExtra,
+  ) => Promise<CallToolResult>;
+};
+
+/**
  * Maps DOM-style event names to their notification `params` types.
  *
  * Used by {@link App `App`} (which extends {@link ProtocolWithEvents `ProtocolWithEvents`})
@@ -262,6 +336,7 @@ export class App extends ProtocolWithEvents<
   private _hostCapabilities?: McpUiHostCapabilities;
   private _hostInfo?: Implementation;
   private _hostContext?: McpUiHostContext;
+  private _registeredTools: { [name: string]: RegisteredAppTool } = {};
   private _initializedSent = false;
 
   /**
@@ -338,6 +413,177 @@ export class App extends ProtocolWithEvents<
     // onEventDispatch (which merges into _hostContext) fires even if the
     // user never assigns onhostcontextchanged or calls addEventListener.
     this.setEventHandler("hostcontextchanged", undefined);
+  }
+
+  private registerCapabilities(capabilities: McpUiAppCapabilities): void {
+    if (this.transport) {
+      throw new Error(
+        "Cannot register capabilities after transport is established",
+      );
+    }
+    this._capabilities = mergeCapabilities(this._capabilities, capabilities);
+  }
+
+  registerTool<
+    OutputArgs extends undefined | StandardSchemaV1 = undefined,
+    InputArgs extends undefined | StandardSchemaV1 = undefined,
+  >(
+    name: string,
+    config: {
+      title?: string;
+      description?: string;
+      inputSchema?: InputArgs;
+      outputSchema?: OutputArgs;
+      annotations?: ToolAnnotations;
+      _meta?: Record<string, unknown>;
+    },
+    cb: AppToolCallback<InputArgs, OutputArgs>,
+  ): RegisteredAppTool {
+    if (this._registeredTools[name]) {
+      throw new Error(`Tool ${name} is already registered`);
+    }
+    const app = this;
+    const notify = () => {
+      if (app._initializedSent && app._capabilities.tools?.listChanged) {
+        void app.sendToolListChanged();
+      }
+    };
+    // Arity is fixed at registration time even if inputSchema is later
+    // update()d, since cb's signature can't change.
+    const cbTakesArgs = config.inputSchema !== undefined;
+    const registeredTool: RegisteredAppTool = {
+      title: config.title,
+      description: config.description,
+      inputSchema: config.inputSchema,
+      outputSchema: config.outputSchema,
+      annotations: config.annotations,
+      _meta: config._meta,
+      enabled: true,
+      enable(): void {
+        this.enabled = true;
+        notify();
+      },
+      disable(): void {
+        this.enabled = false;
+        notify();
+      },
+      update(updates) {
+        Object.assign(this, updates);
+        notify();
+      },
+      remove() {
+        if (app._registeredTools[name] !== registeredTool) return;
+        delete app._registeredTools[name];
+        notify();
+      },
+      handler: async (rawArgs, extra) => {
+        if (!registeredTool.enabled) {
+          throw new Error(`Tool ${name} is disabled`);
+        }
+        let result: CallToolResult;
+        if (cbTakesArgs) {
+          const schema = registeredTool.inputSchema;
+          const parsedArgs = schema
+            ? await validateStandardSchema(
+                schema,
+                rawArgs ?? {},
+                `Invalid input for tool ${name}: `,
+              )
+            : (rawArgs ?? {});
+          result = await (
+            cb as AppToolCallback<StandardSchemaV1, StandardSchemaV1>
+          )(parsedArgs, extra);
+        } else {
+          result = await (cb as AppToolCallback<undefined, StandardSchemaV1>)(
+            extra,
+          );
+        }
+        if (registeredTool.outputSchema && !result.isError) {
+          result.structuredContent = (await validateStandardSchema(
+            registeredTool.outputSchema,
+            result.structuredContent,
+            `Invalid output for tool ${name}: `,
+          )) as CallToolResult["structuredContent"];
+        }
+        return result;
+      },
+    };
+
+    this._registeredTools[name] = registeredTool;
+
+    // Auto-register tools capability so setRequestHandler's capability check
+    // passes. Mirrors McpServer.registerTool behavior — callers shouldn't need
+    // to declare { tools: {} } in the constructor just to use registerTool.
+    // Only do this pre-connect; post-connect the capability was already
+    // advertised (or wasn't) and can't change.
+    if (!this._capabilities.tools && !this.transport) {
+      this.registerCapabilities({ tools: { listChanged: true } });
+    }
+
+    this.ensureToolHandlersInitialized();
+    notify();
+    return registeredTool;
+  }
+
+  private _toolHandlersInitialized = false;
+  private ensureToolHandlersInitialized(): void {
+    if (this._toolHandlersInitialized) {
+      return;
+    }
+    this._toolHandlersInitialized = true;
+
+    this.oncalltool = async (params, extra) => {
+      const tool = this._registeredTools[params.name];
+      if (!tool) {
+        throw new Error(`Tool ${params.name} not found`);
+      }
+      return tool.handler(params.arguments, extra);
+    };
+    this.onlisttools = async (_params, _extra) => {
+      const tools: Tool[] = await Promise.all(
+        Object.entries(this._registeredTools)
+          .filter(([_, tool]) => tool.enabled)
+          .map(async ([name, tool]) => {
+            const result: Tool = {
+              name,
+              title: tool.title,
+              description: tool.description,
+              inputSchema: (tool.inputSchema
+                ? await standardSchemaToJsonSchema(tool.inputSchema, "input")
+                : {
+                    type: "object" as const,
+                    properties: {},
+                  }) as Tool["inputSchema"],
+            };
+            // outputSchema is optional in core MCP — only emit when the app
+            // provided one, otherwise hosts would assume structuredContent.
+            if (tool.outputSchema) {
+              result.outputSchema = (await standardSchemaToJsonSchema(
+                tool.outputSchema,
+                "output",
+              )) as Tool["outputSchema"];
+            }
+            if (tool.annotations) {
+              result.annotations = tool.annotations;
+            }
+            if (tool._meta) {
+              result._meta = tool._meta;
+            }
+            return result;
+          }),
+      );
+      return { tools };
+    };
+  }
+
+  async sendToolListChanged(
+    params: ToolListChangedNotification["params"] = {},
+  ): Promise<void> {
+    this._assertInitialized("sendToolListChanged");
+    await this.notification(<ToolListChangedNotification>{
+      method: "notifications/tools/list_changed",
+      params,
+    });
   }
 
   /**
@@ -765,9 +1011,21 @@ export class App extends ProtocolWithEvents<
    * app.onlisttools = async (params, extra) => {
    *   return {
    *     tools: [
-   *       { name: "greet", inputSchema: { type: "object" as const } },
-   *       { name: "calculate", inputSchema: { type: "object" as const } },
-   *       { name: "format", inputSchema: { type: "object" as const } },
+   *       {
+   *         name: "greet",
+   *         description: "Greet the user",
+   *         inputSchema: { type: "object" as const },
+   *       },
+   *       {
+   *         name: "calculate",
+   *         description: "Perform a calculation",
+   *         inputSchema: { type: "object" as const },
+   *       },
+   *       {
+   *         name: "format",
+   *         description: "Format text",
+   *         inputSchema: { type: "object" as const },
+   *       },
    *     ],
    *   };
    * };
@@ -844,7 +1102,7 @@ export class App extends ProtocolWithEvents<
    * Verify that the app supports the capability required for the given notification method.
    * @internal
    */
-  assertNotificationCapability(method: AppNotification["method"]): void {
+  assertNotificationCapability(_method: AppNotification["method"]): void {
     // TODO
   }
 
